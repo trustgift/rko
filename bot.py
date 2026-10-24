@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sqlite3
 from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, F
@@ -17,19 +18,53 @@ from aiogram.types import (
 # ================= КОНФИГУРАЦИЯ =================
 BOT_TOKEN = "8933053546:AAGFswdXPZH09WVeKYVz-tBSOvLLBzqljHw"
 
-# ID двух наставников (узнать через @userinfobot)
-MENTOR_IDS = [
-    8829145552,  # ID первого наставника
-    8435647377,  # ID второго наставника
-]
-
-MANAGER_USERNAME = "Dnkantk"
+# Данные наставников
+MENTORS = {
+    8829145552: {"name": "@Dnkantk", "username": "Dnkantk"},
+    8435647377: {"name": "@maneymakersss", "username": "maneymakersss"},
+}
 # ================================================
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# --- БАЗА ДАННЫХ (защита от повторного прохождения) ---
+DB_NAME = "survey_users.db"
+
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS completed_users (
+                user_id INTEGER PRIMARY KEY,
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+
+
+def is_user_completed(user_id: int) -> bool:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM completed_users WHERE user_id = ?", (user_id,))
+        return cursor.fetchone() is not None
+
+
+def mark_user_completed(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO completed_users (user_id) VALUES (?)",
+            (user_id,),
+        )
+        conn.commit()
+
+
+# --- ДАННЫЕ БАНКОВ ---
 BANKS_DATA: Dict[str, List[Dict[str, any]]] = {
     "debit": [
         {"id": "tbank_deb", "name": "Т-Банк дебетовая карта", "price": 300},
@@ -62,6 +97,7 @@ class Survey(StatesGroup):
     choosing_banks = State()
 
 
+# Генератор списка с галочками
 def get_banks_keyboard(category: str, selected_ids: set) -> InlineKeyboardMarkup:
     banks = BANKS_DATA[category]
     buttons = []
@@ -87,9 +123,20 @@ def get_banks_keyboard(category: str, selected_ids: set) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+# --- 1. СТАРТ ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
+    # Проверка на повторное прохождение
+    if is_user_completed(message.from_user.id):
+        await message.answer(
+            "⚠️ **Вы уже отправляли заявку.**\n\n"
+            "Повторное прохождение опроса недоступно. Ожидайте связи с выбранным наставником в ЛС.",
+            parse_mode="Markdown",
+        )
+        return
+
     text = (
         "👋 **Добро пожаловать!**\n\n"
         "Этот бот поможет вам узнать, какой доход вы потенциально можете получать, "
@@ -115,8 +162,30 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
+# --- 2. ВЫБОР НАСТАВНИКА ---
 @dp.callback_query(F.data == "start_survey")
-async def ask_18(callback: CallbackQuery):
+async def choose_mentor(callback: CallbackQuery):
+    if is_user_completed(callback.from_user.id):
+        await callback.answer("Вы уже отправляли заявку!", show_alert=True)
+        return
+
+    text = "👤 **Выберите вашего наставника:**"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 @Dnkantk", callback_data="mentor:8829145552")],
+            [InlineKeyboardButton(text="👤 @maneymakersss", callback_data="mentor:8435647377")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await callback.answer()
+
+
+# --- 3. ВОПРОС О 18 ГОДАХ ---
+@dp.callback_query(F.data.startswith("mentor:"))
+async def ask_18(callback: CallbackQuery, state: FSMContext):
+    mentor_id = int(callback.data.split(":")[1])
+    await state.update_data(mentor_id=mentor_id)
+
     text = "❓ **Вопрос 1:** Вам уже исполнилось 18 лет?"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -130,6 +199,7 @@ async def ask_18(callback: CallbackQuery):
     await callback.answer()
 
 
+# --- 4. ВЕТКА МЕНЬШЕ 18 ЛЕТ -> ПРОВЕРКА 14 ЛЕТ ---
 @dp.callback_query(F.data == "age_18_no")
 async def ask_14(callback: CallbackQuery):
     text = "❓ Вам уже исполнилось 14 лет?"
@@ -146,7 +216,8 @@ async def ask_14(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "age_14_no")
-async def reject_under_14(callback: CallbackQuery):
+async def reject_under_14(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     await callback.message.edit_text(
         "❌ **К сожалению, вы нам не подходите.**\n\nСотрудничество возможно только с 14 лет.",
         parse_mode="Markdown",
@@ -154,6 +225,7 @@ async def reject_under_14(callback: CallbackQuery):
     await callback.answer()
 
 
+# --- 5. ВЕТКА 18+ -> ПРОВЕРКА ИП ---
 @dp.callback_query(F.data == "age_18_yes")
 async def ask_ip(callback: CallbackQuery):
     text = "❓ **Вопрос 2:** Есть ли у вас уже открытое ИП?"
@@ -169,8 +241,13 @@ async def ask_ip(callback: CallbackQuery):
     await callback.answer()
 
 
+# --- 6. ПОКАЗ БАНКОВ (ГАЛОЧКИ) ---
 @dp.callback_query(F.data.in_(["age_14_yes", "ip_no", "ip_yes"]))
 async def show_banks(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    mentor_id = data.get("mentor_id", 8829145552)
+    mentor_tag = MENTORS.get(mentor_id, {}).get("name", "@Dnkantk")
+
     if callback.data == "age_14_yes":
         category = "debit"
         age_str = "14–17 лет"
@@ -186,17 +263,17 @@ async def show_banks(callback: CallbackQuery, state: FSMContext):
         header = (
             "📄 **Направление «Рекбиз» (Регистрация ИП + Счёт)**\n\n"
             "💡 _ИП достаточно открыть всего лишь 1 раз, а бизнес-счетов можно открыть по всем банкам._\n"
-            f"Цены часто меняются, для уточнения пишите: @{MANAGER_USERNAME}\n\n"
+            f"Цены часто меняются, по уточнению писать {mentor_tag}\n\n"
             "Отметьте банки, которые хотите открыть:"
         )
-    else:
+    else:  # ip_yes
         category = "rko"
         age_str = "18+"
         ip_str = "Да"
         header = (
             "📄 **Направление «РКО» (Открытие счетов на действующее ИП)**\n\n"
-            "💡 _Цены указаны за открытие только бизнес-счёта при уже имеющемся ИП._\n"
-            f"Цены часто меняются, для уточнения пишите: @{MANAGER_USERNAME}\n\n"
+            "💡 _Цены такие, потому что нужно открыть только бизнес-счёт при уже имеющемся ИП._\n"
+            f"Цены часто меняются, по уточнению писать {mentor_tag}\n\n"
             "Отметьте банки, которые хотите открыть:"
         )
 
@@ -214,6 +291,7 @@ async def show_banks(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# --- 7. ПЕРЕКЛЮЧЕНИЕ ГАЛОЧЕК ---
 @dp.callback_query(Survey.choosing_banks, F.data.startswith("toggle:"))
 async def toggle_bank(callback: CallbackQuery, state: FSMContext):
     bank_id = callback.data.split(":")[1]
@@ -247,8 +325,15 @@ async def toggle_all(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# --- 8. ОТПРАВКА ЗАЯВКИ ТОЛЬКО ВЫБРАННОМУ НАСТАВНИКУ ---
 @dp.callback_query(Survey.choosing_banks, F.data == "submit_selection")
 async def submit_order(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    if is_user_completed(user_id):
+        await callback.answer("Вы уже отправили заявку!", show_alert=True)
+        return
+
     data = await state.get_data()
     selected_ids = set(data.get("selected_ids", set()))
 
@@ -257,19 +342,24 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
         return
 
     category = data["category"]
+    mentor_id = data.get("mentor_id", 8829145552)
     selected_banks = [b for b in BANKS_DATA[category] if b["id"] in selected_ids]
     total_payout = sum(b["price"] for b in selected_banks)
 
-    # 1. Ответ кандидату
+    # Навсегда фиксируем завершение опроса в БД
+    mark_user_completed(user_id)
+
+    # 1. Сообщение кандидату
+    mentor_info = MENTORS.get(mentor_id, {"name": "наставник"})
     await callback.message.edit_text(
         "✅ **Ваша заявка успешно принята!**\n\n"
-        "Ожидайте, в ближайшее время один из наших наставников свяжется с вами в личных сообщениях "
-        "для отправки всех инструкций и ссылок.",
+        f"Ожидайте, ваш наставник ({mentor_info['name']}) свяжется с вами в личных сообщениях "
+        "для отправки всех инструкций и реферальных ссылок.",
         parse_mode="Markdown",
     )
     await callback.answer()
 
-    # 2. Формирование ссылки и кнопки на профиль кандидата
+    # 2. Кнопка перехода в ЛС кандидата
     user = callback.from_user
     username_str = f"@{user.username}" if user.username else "Отсутствует"
 
@@ -299,26 +389,26 @@ async def submit_order(callback: CallbackQuery, state: FSMContext):
         inline_keyboard=[[InlineKeyboardButton(text=button_text, url=account_url)]]
     )
 
-    # 3. Рассылка обоим наставникам
-    for mentor_id in MENTOR_IDS:
-        try:
-            await bot.send_message(
-                chat_id=mentor_id,
-                text=mentor_report,
-                reply_markup=mentor_kb,
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logging.error(f"Не удалось отправить заявку наставнику {mentor_id}: {e}")
+    # 3. Отправка ЛОГОВ ТОЛЬКО ВЫБРАННОМУ НАСТАВНИКУ
+    try:
+        await bot.send_message(
+            chat_id=mentor_id,
+            text=mentor_report,
+            reply_markup=mentor_kb,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить заявку наставнику {mentor_id}: {e}")
 
     await state.clear()
 
 
 async def main():
+    init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
+                   
