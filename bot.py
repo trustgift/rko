@@ -17,7 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8933053546:AAGFswdXPZH09WVeKYVz-tBSOvLLBzqljHw"
+BOT_TOKEN = "8756747119:AAH4RWn0oVCluPBT2gA8-r6DzYJOHm3gMJI"
 SUPER_ADMIN_ID = 8829145552  # Ваш постоянный цифровой Telegram ID
 ADMIN_CMD = "manage_panel"  # Команда открытия CRM-панели (без слеша)
 DB_PATH = "crm_database.db"
